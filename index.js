@@ -7,6 +7,7 @@ import { consolidateMemories } from "./lib/consolidation.js";
 import { buildFtsContext, buildRecallContext } from "./lib/recall.js";
 import { captureFromMessages } from "./lib/capture.js";
 import { extractTopicSignature, saveTopicHistory, checkStuck } from "./lib/stuck-detection.js";
+import { checkSessionHealth } from "./lib/session-guard.js";
 
 export default function register(api) {
   const cfg = api.pluginConfig || {};
@@ -35,6 +36,9 @@ export default function register(api) {
       log.info(`Entities loaded: ${runtimeEntities.size} total`);
       sqliteExec(dbPath, `DELETE FROM decisions WHERE expires_at IS NOT NULL AND expires_at <= ${Date.now()}`);
       if (cfg.consolidation !== false) consolidateMemories(dbPath, (m) => log.info(m));
+      // Session health guard — reset overflowing sessions
+      const guard = checkSessionHealth({ threshold: cfg.sessionOverflowThreshold || 0.8, log: (m) => log.info(m) });
+      if (guard.reset.length > 0) log.warn(`Session overflow: ${guard.reset.join(", ")} auto-reset`);
       if (vecEnabled) {
         (async () => {
           const h = await checkOllamaHealth(ollamaUrl, embModel);
@@ -91,8 +95,25 @@ export default function register(api) {
     async execute(_id, { entity, key, value, ttl = "stable" }) {
       const now = Date.now(), se = escapeSqlValue(entity), sk = escapeSqlValue(key), sv = escapeSqlValue(value);
       const ttlMs = { permanent: null, stable: 90*86400000, active: 14*86400000, session: 86400000 };
-      const tc = ttlMs[ttl] !== undefined ? ttl : "stable";
-      const exp = ttlMs[tc] === null ? "NULL" : now + ttlMs[tc];
+      let tc = ttlMs[ttl] !== undefined ? ttl : "stable";
+      // Layer 2a: Status keyword auto-downgrade
+      const STATUS_KEYWORDS = /(?:status|complete|deployed|spawned|launched|ready|sprint|checklist|final_state|session_|restart|attempt|debug|fix_)/i;
+      if (STATUS_KEYWORDS.test(key) && tc === "permanent") {
+        tc = "active"; // Status facts should not be permanent
+      }
+      // Recalculate exp after tc might have changed
+      let exp = ttlMs[tc] === null ? "NULL" : now + ttlMs[tc];
+      // Layer 2b: Permanent cap — max 15 permanent entries
+      if (tc === "permanent") {
+        const permCount = sqliteQuery(dbPath, `SELECT COUNT(*) as cnt FROM decisions WHERE ttl_class = 'permanent'`);
+        if (permCount[0]?.cnt >= 15) {
+          const oldest = sqliteQuery(dbPath, `SELECT id FROM decisions WHERE ttl_class = 'permanent' ORDER BY timestamp ASC LIMIT 1`);
+          if (oldest.length > 0) {
+            const oid = escapeSqlValue(oldest[0].id);
+            sqliteExec(dbPath, `UPDATE decisions SET ttl_class = 'stable', expires_at = ${now + 90*86400000} WHERE id = '${oid}'`);
+          }
+        }
+      }
       const existing = sqliteQuery(dbPath, `SELECT id FROM decisions WHERE entity = '${se}' AND fact_key = '${sk}' AND (expires_at IS NULL OR expires_at > ${now}) LIMIT 1`);
       let aid;
       if (existing.length > 0) {

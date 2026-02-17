@@ -1,5 +1,16 @@
 # Changelog
 
+## v5.1.0 (2026-02-17)
+
+**Context overflow prevention — three defensive layers**
+
+- **Session health guard** (`lib/session-guard.js`) — Runs at plugin startup, checks all session files against their `contextTokens` cap. Auto-resets sessions exceeding 80% capacity (backs up the `.jsonl`, strips session fields from `sessions.json`). Prevents zombie sessions from growing unboundedly and hitting "context too large" API errors.
+- **Memory store guardrails** — Two protections in the `memory_store` tool:
+  - Status keyword auto-downgrade: fact keys matching status-like patterns (`status`, `complete`, `deployed`, `launched`, etc.) are forced to `active` TTL (14d) even if the LLM requests `permanent`. Prevents session-specific task updates from polluting permanent memory.
+  - Permanent entry cap: max 15 permanent entries. When exceeded, the oldest permanent entry is auto-downgraded to `stable` (90d TTL) before the new one is stored.
+- **Bootstrap token budget** — Bootstrap context injection now enforces a shared 6000-char budget across permanent facts and recent decisions. Entries beyond the budget are silently dropped, preventing context bloat at session start.
+- New config options: `sessionOverflowThreshold` (0.5-0.95, default: 0.8), `maxBootstrapChars` (1000-20000, default: 6000)
+
 ## v5.0.0 (2026-02-17)
 
 **Breaking changes: Complete modularization and generification**

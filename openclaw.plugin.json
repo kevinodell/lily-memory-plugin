@@ -1,7 +1,7 @@
 {
     "id": "lily-memory",
     "name": "Lily Memory",
-    "version": "5.0.0",
+    "version": "5.1.0",
     "description": "Persistent memory plugin for OpenClaw agents. SQLite FTS5 keyword search + Ollama vector embeddings with auto-capture, auto-recall, stuck-detection, and memory consolidation.",
     "kind": "memory",
     "main": "index.js",
@@ -75,6 +75,20 @@
                 "items": { "type": "string" },
                 "default": [],
                 "description": "Additional entity names to recognize (merged with built-in defaults and runtime-added entities)."
+            },
+            "maxBootstrapChars": {
+                "type": "number",
+                "default": 6000,
+                "minimum": 1000,
+                "maximum": 20000,
+                "description": "Maximum characters for bootstrap context injection. Prevents context budget bloat."
+            },
+            "sessionOverflowThreshold": {
+                "type": "number",
+                "default": 0.8,
+                "minimum": 0.5,
+                "maximum": 0.95,
+                "description": "Reset session when estimated tokens exceed this fraction of contextTokens. Set to 0.95 for more tolerance."
             }
         }
     },
