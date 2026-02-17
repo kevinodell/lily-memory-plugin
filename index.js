@@ -28,7 +28,7 @@ export default function register(api) {
   let stuckNudge = null;
 
   // --- Service lifecycle ---
-  api.registerService({ name: "lily-memory",
+  api.registerService({ id: "lily-memory", name: "lily-memory",
     async start() {
       if (!ensureTables(dbPath)) { log.warn("lily-memory: FATAL — failed to create database tables"); return; }
       runtimeEntities = mergeConfigEntities(cfg.entities || [], loadEntitiesFromDb(dbPath));
