@@ -1,5 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, escapeSqlValue } from "./lib/sqlite.js";
 import { checkOllamaHealth, storeEmbedding, vectorSearch, backfillEmbeddings } from "./lib/embeddings.js";
 import { loadEntitiesFromDb, addEntityToDb, mergeConfigEntities } from "./lib/entities.js";
@@ -7,7 +8,24 @@ import { consolidateMemories } from "./lib/consolidation.js";
 import { buildFtsContext, buildRecallContext } from "./lib/recall.js";
 import { captureFromMessages } from "./lib/capture.js";
 import { extractTopicSignature, saveTopicHistory, checkStuck } from "./lib/stuck-detection.js";
-import { checkSessionHealth } from "./lib/session-guard.js";
+import { checkSessionHealth, getContextPressure } from "./lib/session-guard.js";
+import { DEFAULT_BUDGET } from "./lib/budget.js";
+
+// ============================================================================
+// Lily-Memory v5 — budget-aware context injection
+// ============================================================================
+
+/** Max chars for a fact value stored via the memory_store tool. */
+const STORE_MAX_VALUE_LENGTH = 200;
+
+/** Max chars returned per tool search result. */
+const TOOL_RESULT_MAX_CHARS = 4000;
+
+/** Injection cooldown: skip if payload hash matches recent injections. */
+const INJECTION_CACHE_SIZE = 3;
+
+/** Runtime health check frequency: every Nth agent_end event. */
+const HEALTH_CHECK_INTERVAL = 10;
 
 export default function register(api) {
   const cfg = api.pluginConfig || {};
@@ -22,11 +40,22 @@ export default function register(api) {
   const embModel = cfg.embeddingModel || "nomic-embed-text";
   const vecThreshold = cfg.vectorSimilarityThreshold || 0.5;
   const histPath = cfg.topicHistoryPath || path.join(path.dirname(dbPath), "topic-history.json");
+  const baseBudget = cfg.injectionBudget || DEFAULT_BUDGET;
+  const contextCap = cfg.contextTokenCap || 120000;
   const log = api.logger || { info: (m) => console.log("[lily-memory]", m), warn: (m) => console.warn("[lily-memory]", m) };
 
   let vectorsAvailable = false;
   let runtimeEntities = new Set();
   let stuckNudge = null;
+
+  // --- Injection cooldown state ---
+  const recentInjectionHashes = [];
+  let turnCounter = 0;
+  let currentPressureScale = 1.0;
+
+  function hashPayload(text) {
+    return createHash("md5").update(text).digest("hex").substring(0, 12);
+  }
 
   // --- Service lifecycle ---
   api.registerService({ id: "lily-memory", name: "lily-memory",
@@ -51,7 +80,7 @@ export default function register(api) {
     stop() { log.info("lily-memory stopped"); },
   });
 
-  // --- Tool: memory_search ---
+  // --- Tool: memory_search (output-capped) ---
   api.registerTool({ name: "memory_search", label: "Memory Search",
     description: "Search persistent memory using full-text search. Use to recall facts, decisions, preferences, or past context.",
     parameters: { type: "object", properties: {
@@ -67,11 +96,13 @@ export default function register(api) {
       if (!rows.length) rows = sqliteQuery(dbPath, `SELECT entity, fact_key, fact_value, description, category, importance FROM decisions WHERE (description LIKE '%${likeSafe}%' ESCAPE '\\' OR fact_value LIKE '%${likeSafe}%' ESCAPE '\\' OR rationale LIKE '%${likeSafe}%' ESCAPE '\\') AND (expires_at IS NULL OR expires_at > ${now}) ORDER BY importance DESC LIMIT ${safeLimit}`);
       if (!rows.length) return { content: [{ type: "text", text: "No matching memories found." }], details: { count: 0 } };
       const lines = rows.map((r, i) => r.entity && r.fact_key ? `${i+1}. **${r.entity}**.${r.fact_key} = ${r.fact_value}` : `${i+1}. [${r.category}] ${r.description}`);
-      return { content: [{ type: "text", text: `Found ${rows.length} memories:\n\n${lines.join("\n")}` }], details: { count: rows.length, results: rows } };
+      let text = `Found ${rows.length} memories:\n\n${lines.join("\n")}`;
+      if (text.length > TOOL_RESULT_MAX_CHARS) text = text.substring(0, TOOL_RESULT_MAX_CHARS - 20) + "\n\n...(truncated)";
+      return { content: [{ type: "text", text }], details: { count: rows.length, results: rows } };
     },
   }, { name: "memory_search" });
 
-  // --- Tool: memory_entity ---
+  // --- Tool: memory_entity (output-capped) ---
   api.registerTool({ name: "memory_entity", label: "Memory Entity Lookup",
     description: "Look up all known facts about a specific entity (person, config, system). Use for targeted knowledge retrieval.",
     parameters: { type: "object", properties: { entity: { type: "string", description: "Entity name" } }, required: ["entity"] },
@@ -79,31 +110,41 @@ export default function register(api) {
       const rows = sqliteQuery(dbPath, `SELECT fact_key, fact_value, category, importance, ttl_class FROM decisions WHERE entity = '${escapeSqlValue(entity)}' AND (expires_at IS NULL OR expires_at > ${Date.now()}) ORDER BY importance DESC, timestamp DESC LIMIT 20`);
       if (!rows.length) return { content: [{ type: "text", text: `No facts found for entity "${entity}".` }], details: { count: 0 } };
       const lines = rows.map((r) => `- **${r.fact_key}** = ${r.fact_value} _(${r.ttl_class})_`);
-      return { content: [{ type: "text", text: `Facts about **${entity}** (${rows.length}):\n\n${lines.join("\n")}` }], details: { count: rows.length, results: rows } };
+      let text = `Facts about **${entity}** (${rows.length}):\n\n${lines.join("\n")}`;
+      if (text.length > TOOL_RESULT_MAX_CHARS) text = text.substring(0, TOOL_RESULT_MAX_CHARS - 20) + "\n\n...(truncated)";
+      return { content: [{ type: "text", text }], details: { count: rows.length, results: rows } };
     },
   }, { name: "memory_entity" });
 
-  // --- Tool: memory_store ---
+  // --- Tool: memory_store (VALUE LENGTH CAPPED) ---
   api.registerTool({ name: "memory_store", label: "Memory Store",
-    description: "Save a fact to persistent memory. Use for preferences, decisions, and important information that should survive session resets.",
+    description: `Save a fact to persistent memory. Values are capped at ${STORE_MAX_VALUE_LENGTH} chars. Use concise key=value pairs, not paragraphs. For preferences, decisions, and important information that should survive session resets.`,
     parameters: { type: "object", properties: {
       entity: { type: "string", description: "Entity name" },
       key: { type: "string", description: "Fact key" },
-      value: { type: "string", description: "Fact value" },
+      value: { type: "string", description: `Fact value (max ${STORE_MAX_VALUE_LENGTH} chars — be concise)` },
       ttl: { type: "string", description: "TTL: permanent, stable (90d), active (14d), session (24h). Default: stable" },
     }, required: ["entity", "key", "value"] },
     async execute(_id, { entity, key, value, ttl = "stable" }) {
+      // Enforce value length cap
+      if (value && value.length > STORE_MAX_VALUE_LENGTH) {
+        value = value.substring(0, STORE_MAX_VALUE_LENGTH - 3) + "...";
+        log.info?.(`lily-memory: memory_store value truncated to ${STORE_MAX_VALUE_LENGTH} chars for ${entity}.${key}`);
+      }
+
       const now = Date.now(), se = escapeSqlValue(entity), sk = escapeSqlValue(key), sv = escapeSqlValue(value);
       const ttlMs = { permanent: null, stable: 90*86400000, active: 14*86400000, session: 86400000 };
       let tc = ttlMs[ttl] !== undefined ? ttl : "stable";
-      // Layer 2a: Status keyword auto-downgrade
-      const STATUS_KEYWORDS = /(?:status|complete|deployed|spawned|launched|ready|sprint|checklist|final_state|session_|restart|attempt|debug|fix_)/i;
-      if (STATUS_KEYWORDS.test(key) && tc === "permanent") {
-        tc = "active"; // Status facts should not be permanent
+
+      // Status keyword auto-downgrade
+      const STATUS_KEYWORDS = /(?:status|complete|deployed|spawned|launched|ready|sprint|checklist|final_state|session_|restart|attempt|debug|fix_|milestone|infrastructure|live_|validation_)/i;
+      if (STATUS_KEYWORDS.test(key) && (tc === "permanent" || tc === "stable")) {
+        tc = "active";
       }
-      // Recalculate exp after tc might have changed
+
       let exp = ttlMs[tc] === null ? "NULL" : now + ttlMs[tc];
-      // Layer 2b: Permanent cap — max 15 permanent entries
+
+      // Permanent cap — max 15 permanent entries
       if (tc === "permanent") {
         const permCount = sqliteQuery(dbPath, `SELECT COUNT(*) as cnt FROM decisions WHERE ttl_class = 'permanent'`);
         if (permCount[0]?.cnt >= 15) {
@@ -114,6 +155,7 @@ export default function register(api) {
           }
         }
       }
+
       const existing = sqliteQuery(dbPath, `SELECT id FROM decisions WHERE entity = '${se}' AND fact_key = '${sk}' AND (expires_at IS NULL OR expires_at > ${now}) LIMIT 1`);
       let aid;
       if (existing.length > 0) {
@@ -129,7 +171,7 @@ export default function register(api) {
     },
   }, { name: "memory_store" });
 
-  // --- Tool: memory_semantic_search ---
+  // --- Tool: memory_semantic_search (output-capped) ---
   api.registerTool({ name: "memory_semantic_search", label: "Memory Semantic Search",
     description: "Search memory using semantic similarity (vector embeddings). Finds related memories even when exact keywords don't match.",
     parameters: { type: "object", properties: {
@@ -144,7 +186,9 @@ export default function register(api) {
       const rows = await vectorSearch(dbPath, ollamaUrl, embModel, query, safeLimit, threshold);
       if (!rows.length) return { content: [{ type: "text", text: "No semantically similar memories found." }], details: { count: 0 } };
       const lines = rows.map((r, i) => { const s = (r.similarity*100).toFixed(0); return r.entity && r.fact_key ? `${i+1}. **${r.entity}**.${r.fact_key} = ${r.fact_value} _(${s}% similar)_` : `${i+1}. [${r.category}] ${r.description} _(${s}% similar)_`; });
-      return { content: [{ type: "text", text: `Found ${rows.length} semantically similar memories:\n\n${lines.join("\n")}` }], details: { count: rows.length, results: rows } };
+      let text = `Found ${rows.length} semantically similar memories:\n\n${lines.join("\n")}`;
+      if (text.length > TOOL_RESULT_MAX_CHARS) text = text.substring(0, TOOL_RESULT_MAX_CHARS - 20) + "\n\n...(truncated)";
+      return { content: [{ type: "text", text }], details: { count: rows.length, results: rows } };
     },
   }, { name: "memory_semantic_search" });
 
@@ -161,28 +205,74 @@ export default function register(api) {
     },
   }, { name: "memory_add_entity" });
 
-  // --- Hook: before_agent_start (recall) ---
+  // --- Hook: before_agent_start (budget-aware recall with injection cooldown) ---
   if (autoRecall) {
     api.on("before_agent_start", async (event) => {
       try {
+        // Apply context pressure scaling to budget
+        const effectiveBudget = Math.floor(baseBudget * currentPressureScale);
+
+        // If pressure is critical, skip injection entirely
+        if (effectiveBudget <= 0) {
+          log.info?.("lily-memory: injection skipped (context pressure: critical)");
+          return;
+        }
+
         const prompt = event.prompt || "", parts = [];
-        const { lines: ftsLines, ftsIds } = buildFtsContext(dbPath, prompt, maxRecallResults);
+
+        // Build budget-aware FTS context
+        const { lines: ftsLines, ftsIds, budgetReport } = buildFtsContext(dbPath, prompt, maxRecallResults, effectiveBudget);
+
+        // Vector search uses remaining budget
         let vec = [];
-        if (vectorsAvailable && prompt.length >= 10) { try { vec = await vectorSearch(dbPath, ollamaUrl, embModel, prompt, 5, vecThreshold); } catch {} }
-        const ctx = buildRecallContext(ftsLines, ftsIds, vec);
+        if (vectorsAvailable && prompt.length >= 10 && budgetReport.remaining > 100) {
+          try { vec = await vectorSearch(dbPath, ollamaUrl, embModel, prompt, 5, vecThreshold); } catch {}
+        }
+
+        const ctx = buildRecallContext(ftsLines, ftsIds, vec, budgetReport.remaining);
         if (ctx) parts.push(ctx);
+
         if (stuckEnabled && stuckNudge) { parts.push("\n" + stuckNudge); stuckNudge = null; }
         if (!parts.length) return;
+
         const full = parts.join("\n");
-        log.info?.(`lily-memory: injecting ${full.length} chars of context`);
+
+        // Injection cooldown: skip if identical to recent injections
+        const payloadHash = hashPayload(full);
+        if (recentInjectionHashes.includes(payloadHash)) {
+          log.info?.(`lily-memory: injection skipped (duplicate, hash ${payloadHash})`);
+          return;
+        }
+        recentInjectionHashes.push(payloadHash);
+        if (recentInjectionHashes.length > INJECTION_CACHE_SIZE) {
+          recentInjectionHashes.shift();
+        }
+
+        log.info?.(`lily-memory: injecting ${full.length} chars (budget: ${effectiveBudget}, used: ${budgetReport.used}, pressure: ${currentPressureScale})`);
         return { prependContext: full };
       } catch (e) { log.warn?.(`lily-memory: recall failed: ${String(e)}`); }
     });
   }
 
-  // --- Hook: agent_end (capture) ---
+  // --- Hook: agent_end (capture + runtime health check) ---
   if (autoCapture) {
     api.on("agent_end", async (event) => {
+      turnCounter++;
+
+      // Runtime context pressure check (every HEALTH_CHECK_INTERVAL turns)
+      if (turnCounter % HEALTH_CHECK_INTERVAL === 0) {
+        const messageCount = event.messages?.length || 0;
+        const pressure = getContextPressure({
+          messageCount,
+          contextCap,
+          log: (m) => log.info?.(m),
+        });
+        currentPressureScale = pressure.scale;
+        if (pressure.level === "critical") {
+          log.warn?.(`lily-memory: context pressure CRITICAL — injection disabled until session resets`);
+        }
+      }
+
       if (!event.success || !event.messages?.length) return;
       try {
         const { stored, newDecisionIds } = captureFromMessages(dbPath, event.messages, maxCapturePerTurn, runtimeEntities, (m) => log.info(m));
@@ -200,6 +290,16 @@ export default function register(api) {
         }
       } catch (e) { log.warn?.(`lily-memory: capture failed: ${String(e)}`); }
     });
+  } else {
+    // Even without auto-capture, run health checks
+    api.on("agent_end", async (event) => {
+      turnCounter++;
+      if (turnCounter % HEALTH_CHECK_INTERVAL === 0) {
+        const messageCount = event.messages?.length || 0;
+        const pressure = getContextPressure({ messageCount, contextCap, log: (m) => log.info?.(m) });
+        currentPressureScale = pressure.scale;
+      }
+    });
   }
 
   // --- Hook: before_compaction ---
@@ -212,9 +312,16 @@ export default function register(api) {
 
   // --- Hook: after_compaction ---
   api.on("after_compaction", async () => {
-    try { saveTopicHistory(histPath, []); log.info("lily-memory: topic history reset after compaction"); }
-    catch (e) { log.warn?.(`lily-memory: after_compaction failed: ${String(e)}`); }
+    try {
+      // Reset injection cache — compaction changes context significantly
+      recentInjectionHashes.length = 0;
+      // Reset pressure scale — compaction frees context
+      currentPressureScale = 1.0;
+      turnCounter = 0;
+      saveTopicHistory(histPath, []);
+      log.info("lily-memory: post-compaction reset (injection cache cleared, pressure reset)");
+    } catch (e) { log.warn?.(`lily-memory: after_compaction failed: ${String(e)}`); }
   });
 
-  log.info(`lily-memory v5: registered (db: ${dbPath}, recall: ${autoRecall}, capture: ${autoCapture}, stuck: ${stuckEnabled}, vectors: ${vecEnabled})`);
+  log.info(`lily-memory v5: registered (db: ${dbPath}, recall: ${autoRecall}, capture: ${autoCapture}, stuck: ${stuckEnabled}, vectors: ${vecEnabled}, budget: ${baseBudget} chars)`);
 }
