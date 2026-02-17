@@ -4,3 +4,4 @@ node_modules/
 *.db-wal
 *.db-shm
 topic-history.json
+research/
