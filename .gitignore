@@ -1,0 +1,6 @@
+node_modules/
+.omc/
+*.db
+*.db-wal
+*.db-shm
+topic-history.json
