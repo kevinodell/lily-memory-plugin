@@ -27,7 +27,7 @@ Persistent memory plugin for OpenClaw agents. Gives your agent long-term memory 
 ## Requirements
 
 - Node.js 18+ (for native `fetch`)
-- `better-sqlite3` npm package (installed automatically)
+- `better-sqlite3` npm package (installed via `npm install`)
 - Optional: Ollama with `nomic-embed-text` model for semantic search
 
 ## Quick Start
