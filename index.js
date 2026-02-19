@@ -1,7 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, escapeSqlValue } from "./lib/sqlite.js";
+import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, escapeSqlValue, closeAllConnections } from "./lib/sqlite.js";
 import { checkOllamaHealth, storeEmbedding, vectorSearch, backfillEmbeddings } from "./lib/embeddings.js";
 import { loadEntitiesFromDb, addEntityToDb, mergeConfigEntities } from "./lib/entities.js";
 import { consolidateMemories } from "./lib/consolidation.js";
@@ -63,7 +63,7 @@ export default function register(api) {
       if (!ensureTables(dbPath)) { log.warn("lily-memory: FATAL — failed to create database tables"); return; }
       runtimeEntities = mergeConfigEntities(cfg.entities || [], loadEntitiesFromDb(dbPath));
       log.info(`Entities loaded: ${runtimeEntities.size} total`);
-      sqliteExec(dbPath, `DELETE FROM decisions WHERE expires_at IS NOT NULL AND expires_at <= ${Date.now()}`);
+      sqliteExec(dbPath, `DELETE FROM decisions WHERE expires_at IS NOT NULL AND expires_at <= ?`, [Date.now()]);
       if (cfg.consolidation !== false) consolidateMemories(dbPath, (m) => log.info(m));
       // Session health guard — reset overflowing sessions
       const guard = checkSessionHealth({ threshold: cfg.sessionOverflowThreshold || 0.8, log: (m) => log.info(m) });
@@ -77,7 +77,10 @@ export default function register(api) {
         })().catch((e) => log.warn?.(`Vector init error: ${e.message}`));
       }
     },
-    stop() { log.info("lily-memory stopped"); },
+    stop() {
+      closeAllConnections();
+      log.info("lily-memory stopped");
+    },
   });
 
   // --- Tool: memory_search (output-capped) ---
@@ -88,12 +91,33 @@ export default function register(api) {
       limit: { type: "number", description: "Max results (default: 10)" },
     }, required: ["query"] },
     async execute(_id, { query, limit = 10 }) {
-      const now = Date.now(), safe = escapeSqlValue(query);
+      const now = Date.now();
       const safeLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
-      const ftsPhrase = `"${safe.replace(/"/g, '""')}"`;
-      const likeSafe = safe.replace(/%/g, '\\%').replace(/_/g, '\\_');
-      let rows = sqliteQuery(dbPath, `SELECT d.entity, d.fact_key, d.fact_value, d.description, d.category, d.importance FROM decisions d JOIN decisions_fts fts ON d.rowid = fts.rowid WHERE decisions_fts MATCH '${ftsPhrase}' AND (d.expires_at IS NULL OR d.expires_at > ${now}) ORDER BY rank LIMIT ${safeLimit}`);
-      if (!rows.length) rows = sqliteQuery(dbPath, `SELECT entity, fact_key, fact_value, description, category, importance FROM decisions WHERE (description LIKE '%${likeSafe}%' ESCAPE '\\' OR fact_value LIKE '%${likeSafe}%' ESCAPE '\\' OR rationale LIKE '%${likeSafe}%' ESCAPE '\\') AND (expires_at IS NULL OR expires_at > ${now}) ORDER BY importance DESC LIMIT ${safeLimit}`);
+
+      // FTS5 search with parameterized query
+      let rows = sqliteQuery(dbPath, `
+        SELECT d.entity, d.fact_key, d.fact_value, d.description, d.category, d.importance
+        FROM decisions d
+        JOIN decisions_fts fts ON d.rowid = fts.rowid
+        WHERE decisions_fts MATCH ?
+          AND (d.expires_at IS NULL OR d.expires_at > ?)
+        ORDER BY rank
+        LIMIT ?
+      `, [query, now, safeLimit]);
+
+      // Fallback to LIKE search
+      if (!rows.length) {
+        const likePattern = `%${query}%`;
+        rows = sqliteQuery(dbPath, `
+          SELECT entity, fact_key, fact_value, description, category, importance
+          FROM decisions
+          WHERE (description LIKE ? OR fact_value LIKE ? OR rationale LIKE ?)
+            AND (expires_at IS NULL OR expires_at > ?)
+          ORDER BY importance DESC
+          LIMIT ?
+        `, [likePattern, likePattern, likePattern, now, safeLimit]);
+      }
+
       if (!rows.length) return { content: [{ type: "text", text: "No matching memories found." }], details: { count: 0 } };
       const lines = rows.map((r, i) => r.entity && r.fact_key ? `${i+1}. **${r.entity}**.${r.fact_key} = ${r.fact_value}` : `${i+1}. [${r.category}] ${r.description}`);
       let text = `Found ${rows.length} memories:\n\n${lines.join("\n")}`;
@@ -107,7 +131,14 @@ export default function register(api) {
     description: "Look up all known facts about a specific entity (person, config, system). Use for targeted knowledge retrieval.",
     parameters: { type: "object", properties: { entity: { type: "string", description: "Entity name" } }, required: ["entity"] },
     async execute(_id, { entity }) {
-      const rows = sqliteQuery(dbPath, `SELECT fact_key, fact_value, category, importance, ttl_class FROM decisions WHERE entity = '${escapeSqlValue(entity)}' AND (expires_at IS NULL OR expires_at > ${Date.now()}) ORDER BY importance DESC, timestamp DESC LIMIT 20`);
+      const rows = sqliteQuery(dbPath, `
+        SELECT fact_key, fact_value, category, importance, ttl_class
+        FROM decisions
+        WHERE entity = ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY importance DESC, timestamp DESC
+        LIMIT 20
+      `, [entity, Date.now()]);
       if (!rows.length) return { content: [{ type: "text", text: `No facts found for entity "${entity}".` }], details: { count: 0 } };
       const lines = rows.map((r) => `- **${r.fact_key}** = ${r.fact_value} _(${r.ttl_class})_`);
       let text = `Facts about **${entity}** (${rows.length}):\n\n${lines.join("\n")}`;
@@ -132,7 +163,8 @@ export default function register(api) {
         log.info?.(`lily-memory: memory_store value truncated to ${STORE_MAX_VALUE_LENGTH} chars for ${entity}.${key}`);
       }
 
-      const now = Date.now(), se = escapeSqlValue(entity), sk = escapeSqlValue(key), sv = escapeSqlValue(value);
+      const now = Date.now();
+      const se = escapeSqlValue(entity), sk = escapeSqlValue(key), sv = escapeSqlValue(value);
       const ttlMs = { permanent: null, stable: 90*86400000, active: 14*86400000, session: 86400000 };
       let tc = ttlMs[ttl] !== undefined ? ttl : "stable";
 
@@ -142,7 +174,7 @@ export default function register(api) {
         tc = "active";
       }
 
-      let exp = ttlMs[tc] === null ? "NULL" : now + ttlMs[tc];
+      const exp = ttlMs[tc] === null ? null : now + ttlMs[tc];
 
       // Permanent cap — max 15 permanent entries
       if (tc === "permanent") {
@@ -150,20 +182,33 @@ export default function register(api) {
         if (permCount[0]?.cnt >= 15) {
           const oldest = sqliteQuery(dbPath, `SELECT id FROM decisions WHERE ttl_class = 'permanent' ORDER BY timestamp ASC LIMIT 1`);
           if (oldest.length > 0) {
-            const oid = escapeSqlValue(oldest[0].id);
-            sqliteExec(dbPath, `UPDATE decisions SET ttl_class = 'stable', expires_at = ${now + 90*86400000} WHERE id = '${oid}'`);
+            sqliteExec(dbPath,
+              `UPDATE decisions SET ttl_class = 'stable', expires_at = ? WHERE id = ?`,
+              [now + 90*86400000, oldest[0].id]
+            );
           }
         }
       }
 
-      const existing = sqliteQuery(dbPath, `SELECT id FROM decisions WHERE entity = '${se}' AND fact_key = '${sk}' AND (expires_at IS NULL OR expires_at > ${now}) LIMIT 1`);
+      const existing = sqliteQuery(dbPath,
+        `SELECT id FROM decisions WHERE entity = ? AND fact_key = ? AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`,
+        [se, sk, now]
+      );
       let aid;
       if (existing.length > 0) {
         aid = existing[0].id;
-        sqliteExec(dbPath, `UPDATE decisions SET fact_value = '${sv}', timestamp = ${now}, last_accessed_at = ${now}, ttl_class = '${tc}', expires_at = ${exp} WHERE id = '${escapeSqlValue(aid)}'`);
+        sqliteExec(dbPath,
+          `UPDATE decisions SET fact_value = ?, timestamp = ?, last_accessed_at = ?, ttl_class = ?, expires_at = ? WHERE id = ?`,
+          [sv, now, now, tc, exp, aid]
+        );
       } else {
         aid = randomUUID();
-        sqliteExec(dbPath, `INSERT INTO decisions (id, session_id, timestamp, category, description, rationale, classification, importance, ttl_class, expires_at, last_accessed_at, entity, fact_key, fact_value, tags) VALUES ('${escapeSqlValue(aid)}', 'tool', ${now}, 'manual', '${se}.${sk} = ${sv}', 'Stored via memory_store tool', 'ARCHIVE', 0.9, '${tc}', ${exp}, ${now}, '${se}', '${sk}', '${sv}', '["tool"]')`);
+        const description = `${se}.${sk} = ${sv}`;
+        sqliteExec(dbPath,
+          `INSERT INTO decisions (id, session_id, timestamp, category, description, rationale, classification, importance, ttl_class, expires_at, last_accessed_at, entity, fact_key, fact_value, tags)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [aid, 'tool', now, 'manual', description, 'Stored via memory_store tool', 'ARCHIVE', 0.9, tc, exp, now, se, sk, sv, '["tool"]']
+        );
       }
       if (vectorsAvailable) storeEmbedding(dbPath, ollamaUrl, embModel, aid, `${entity}.${key} = ${value}`).catch((e) => log.warn?.(`lily-memory: embedding failed: ${e.message}`));
       const verb = existing.length > 0 ? "Updated" : "Stored";
@@ -305,7 +350,10 @@ export default function register(api) {
   // --- Hook: before_compaction ---
   api.on("before_compaction", async () => {
     try {
-      sqliteExec(dbPath, `UPDATE decisions SET last_accessed_at = ${Date.now()} WHERE ttl_class = 'permanent'`);
+      sqliteExec(dbPath,
+        `UPDATE decisions SET last_accessed_at = ? WHERE ttl_class = 'permanent'`,
+        [Date.now()]
+      );
       log.info("lily-memory: compaction — permanent memories touched");
     } catch (e) { log.warn?.(`lily-memory: before_compaction failed: ${String(e)}`); }
   });

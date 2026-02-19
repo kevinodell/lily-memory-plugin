@@ -1,10 +1,11 @@
 ---
 name: lily-memory
-description: Persistent memory plugin for OpenClaw agents. Hybrid SQLite FTS5 keyword + Ollama vector semantic search with auto-capture, auto-recall, stuck-detection, and memory consolidation. Zero npm dependencies.
+description: Persistent memory plugin for OpenClaw agents. Hybrid SQLite FTS5 keyword + Ollama vector semantic search with auto-capture, auto-recall, stuck-detection, and memory consolidation.
 metadata:
   openclaw:
     requires:
-      bins: [node, sqlite3]
+      bins: [node]
+      npm: [better-sqlite3]
     primaryEnv: ""
 ---
 
@@ -21,12 +22,12 @@ Persistent memory plugin for OpenClaw agents. Gives your agent long-term memory 
 - **Memory consolidation**: Deduplicates entries on startup
 - **Dynamic entities**: Config-driven allowlist + runtime tool to add entities
 - **Graceful degradation**: Works without Ollama (keyword-only mode)
-- **Zero npm dependencies**: Uses sqlite3 CLI + native fetch
+- **Minimal dependencies**: Uses better-sqlite3 for secure parameterized queries + native fetch
 
 ## Requirements
 
 - Node.js 18+ (for native `fetch`)
-- SQLite 3.33+ with FTS5 (ships with macOS; `apt install sqlite3` on Linux)
+- `better-sqlite3` npm package (installed automatically)
 - Optional: Ollama with `nomic-embed-text` model for semantic search
 
 ## Quick Start

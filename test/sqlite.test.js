@@ -1,14 +1,15 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import path from "node:path";
 import {
   resolveDbPath,
   escapeSqlValue,
   sqliteQuery,
   sqliteExec,
-  ensureTables
+  ensureTables,
+  closeAllConnections
 } from "../lib/sqlite.js";
 
 describe("SQLite utilities", () => {
@@ -21,6 +22,7 @@ describe("SQLite utilities", () => {
   });
 
   after(() => {
+    closeAllConnections();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -32,18 +34,23 @@ describe("SQLite utilities", () => {
       assert.ok(result.endsWith("/.openclaw/memory/decisions.db"));
     });
 
-    it("passes through absolute paths unchanged", () => {
-      const absolutePath = "/tmp/test.db";
-      const result = resolveDbPath(absolutePath);
-      assert.equal(result, absolutePath);
-    });
-
     it("returns default path when null or undefined", () => {
       const resultNull = resolveDbPath(null);
       const resultUndef = resolveDbPath(undefined);
       assert.ok(resultNull.includes(".openclaw/memory/decisions.db"));
       assert.ok(resultUndef.includes(".openclaw/memory/decisions.db"));
       assert.equal(resultNull, resultUndef);
+    });
+
+    it("rejects paths outside allowed directory", () => {
+      assert.throws(() => resolveDbPath("/tmp/test.db"), /Path traversal detected/);
+      assert.throws(() => resolveDbPath("../../etc/passwd"), /Path traversal detected/);
+      assert.throws(() => resolveDbPath("~/.openclaw/../../sensitive.db"), /Path traversal detected/);
+    });
+
+    it("accepts valid paths within ~/.openclaw/memory/", () => {
+      const result = resolveDbPath("~/.openclaw/memory/custom.db");
+      assert.ok(result.endsWith("/.openclaw/memory/custom.db"));
     });
   });
 
@@ -53,9 +60,9 @@ describe("SQLite utilities", () => {
       assert.equal(result, "hello world");
     });
 
-    it("escapes single quotes", () => {
+    it("passes through single quotes (parameterized queries handle safety)", () => {
       const result = escapeSqlValue("it's a test");
-      assert.equal(result, "it''s a test");
+      assert.equal(result, "it's a test");
     });
 
     it("removes null bytes", () => {
@@ -85,8 +92,8 @@ describe("SQLite utilities", () => {
   describe("sqliteQuery", () => {
     it("returns rows for valid SELECT", () => {
       ensureTables(testDbPath);
-      sqliteExec(testDbPath, "INSERT INTO entities (name, display_name) VALUES ('test', 'Test Entity')");
-      const rows = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name='test'");
+      sqliteExec(testDbPath, "INSERT INTO entities (name, display_name) VALUES (?, ?)", ["test", "Test Entity"]);
+      const rows = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name = ?", ["test"]);
       assert.ok(Array.isArray(rows));
       assert.equal(rows.length, 1);
       assert.equal(rows[0].name, "test");
@@ -95,7 +102,7 @@ describe("SQLite utilities", () => {
 
     it("returns empty array for no results", () => {
       ensureTables(testDbPath);
-      const rows = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name='nonexistent'");
+      const rows = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name = ?", ["nonexistent"]);
       assert.ok(Array.isArray(rows));
       assert.equal(rows.length, 0);
     });
@@ -110,14 +117,14 @@ describe("SQLite utilities", () => {
   describe("sqliteExec", () => {
     it("returns true for successful INSERT", () => {
       ensureTables(testDbPath);
-      const result = sqliteExec(testDbPath, "INSERT INTO entities (name, display_name) VALUES ('exec-test', 'Exec Test')");
+      const result = sqliteExec(testDbPath, "INSERT INTO entities (name, display_name) VALUES (?, ?)", ["exec-test", "Exec Test"]);
       assert.equal(result, true);
-      const rows = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name='exec-test'");
+      const rows = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name = ?", ["exec-test"]);
       assert.equal(rows.length, 1);
     });
 
     it("returns false for invalid SQL", () => {
-      const result = sqliteExec(testDbPath, "INSERT INTO nonexistent_table (col) VALUES ('val')");
+      const result = sqliteExec(testDbPath, "INSERT INTO nonexistent_table (col) VALUES (?)", ["val"]);
       assert.equal(result, false);
     });
   });
@@ -172,6 +179,32 @@ describe("SQLite utilities", () => {
       // Verify tables still exist and have correct structure
       const decisionsInfo = sqliteQuery(testDbPath, "PRAGMA table_info(decisions)");
       assert.ok(decisionsInfo.length > 0);
+    });
+  });
+
+  describe("Security: SQL Injection Prevention", () => {
+    it("safely handles SQL injection attempts via parameterized queries", () => {
+      ensureTables(testDbPath);
+      const malicious = "test' OR '1'='1";
+      sqliteExec(testDbPath, "INSERT INTO entities (name, display_name) VALUES (?, ?)", ["real-entity", "Real"]);
+      const results = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name = ?", [malicious]);
+      assert.equal(results.length, 0, "injection should not bypass WHERE clause");
+    });
+
+    it("safely stores and retrieves values with quotes", () => {
+      ensureTables(testDbPath);
+      const entityWithQuotes = "Kevin's Entity";
+      sqliteExec(testDbPath, "INSERT INTO entities (name, display_name) VALUES (?, ?)", ["quoted", entityWithQuotes]);
+      const rows = sqliteQuery(testDbPath, "SELECT display_name FROM entities WHERE name = ?", ["quoted"]);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].display_name, entityWithQuotes);
+    });
+
+    it("safely handles LIKE injection attempts", () => {
+      ensureTables(testDbPath);
+      const maliciousLike = "%' OR '1'='1";
+      const results = sqliteQuery(testDbPath, "SELECT * FROM entities WHERE name LIKE ?", [maliciousLike]);
+      assert.equal(results.length, 0, "LIKE injection should not return all rows");
     });
   });
 });
