@@ -1,7 +1,8 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, sanitizeValue, closeAllConnections } from "./lib/sqlite.js";
+import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, sanitizeValue, closeAllConnections, runMigrations } from "./lib/sqlite.js";
+import { registerPipelineTools } from "./lib/pipeline.js";
 import { checkOllamaHealth, storeEmbedding, vectorSearch, backfillEmbeddings } from "./lib/embeddings.js";
 import { loadEntitiesFromDb, addEntityToDb, mergeConfigEntities } from "./lib/entities.js";
 import { consolidateMemories } from "./lib/consolidation.js";
@@ -73,6 +74,7 @@ export default function register(api) {
   api.registerService({ id: "lily-memory", name: "lily-memory",
     async start() {
       if (!ensureTables(dbPath)) { log.warn("lily-memory: FATAL — failed to create database tables"); return; }
+      runMigrations(dbPath);
       runtimeEntities = mergeConfigEntities(cfg.entities || [], loadEntitiesFromDb(dbPath));
       log.info(`Entities loaded: ${runtimeEntities.size} total`);
       sqliteExec(dbPath, `DELETE FROM decisions WHERE expires_at IS NOT NULL AND expires_at <= ?`, [Date.now()]);
@@ -405,6 +407,9 @@ export default function register(api) {
       log.info("lily-memory: post-compaction reset (injection cache cleared, pressure reset)");
     } catch (e) { log.warn?.(`lily-memory: after_compaction failed: ${String(e)}`); }
   });
+
+  // --- Pipeline tools ---
+  registerPipelineTools(api, dbPath, log);
 
   log.info(`lily-memory v5: registered (db: ${dbPath}, recall: ${autoRecall}, capture: ${autoCapture}, stuck: ${stuckEnabled}, vectors: ${vecEnabled}, budget: ${baseBudget} chars)`);
 }

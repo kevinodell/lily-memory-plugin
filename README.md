@@ -187,7 +187,7 @@ User: "Start remembering facts about Alice"
 ### Consolidation (startup)
 
 1. Find duplicate (entity, fact_key) groups
-2. Keep row with latest `updated_at`, delete rest
+2. Keep row with latest `timestamp`, delete rest
 3. Boost survivor importance +0.05 (capped at 0.95)
 4. Clean orphaned vectors
 
