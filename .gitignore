@@ -5,5 +5,3 @@ node_modules/
 *.db-shm
 topic-history.json
 research/
-INSTRUCTIONS.md
-doc-archive/
