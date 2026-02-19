@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureTables, closeAllConnections, sqliteQuery, sqliteExec, runMigrations } from "../lib/sqlite.js";
-import { createPipeline, startPipeline, getPipelineStatus, advanceStep, cancelPipeline, schedulePipeline, lilyToday } from "../lib/pipeline.js";
+import { createPipeline, startPipeline, getPipelineStatus, advanceStep, cancelPipeline, schedulePipeline, lilyToday, pipelineTick } from "../lib/pipeline.js";
 import { loadDAG, readySteps } from "../lib/graph.js";
 
 describe("Pipeline Engine", () => {
@@ -386,6 +386,62 @@ describe("Pipeline Engine", () => {
       assert.ok(typeof summary === "string");
       assert.ok(summary.includes("Pipeline Status"));
       assert.ok(summary.includes("Memory:"));
+    });
+  });
+
+  describe("pipelineTick", () => {
+    it("returns ready steps from running pipelines", () => {
+      const created = createPipeline(dbPath, {
+        name: "test-tick",
+        trigger_message: "test",
+        steps: [
+          { name: "step-a", prompt: "Do step A" },
+          { name: "step-b", prompt: "Do step B", depends_on: ["step-a"] },
+        ],
+      });
+      startPipeline(dbPath, created.pipelineId);
+
+      const tick = pipelineTick(dbPath);
+      assert.ok(tick.work.length > 0);
+      const stepA = tick.work.find(w => w.pipelineName === "test-tick" && w.stepName === "step-a");
+      assert.ok(stepA);
+      assert.equal(stepA.prompt, "Do step A");
+    });
+
+    it("returns empty when no work pending", () => {
+      // Cancel the pipeline so it's not running
+      const pipelines = sqliteQuery(dbPath,
+        `SELECT id FROM pipelines WHERE name = 'test-tick'`
+      );
+      for (const p of pipelines) cancelPipeline(dbPath, p.id);
+
+      const tick = pipelineTick(dbPath);
+      // Filter to just our test pipeline's work (other tests may leave running pipelines)
+      const tickWork = tick.work.filter(w => w.pipelineName === "test-tick");
+      assert.equal(tickWork.length, 0);
+    });
+
+    it("includes parent context in ready steps", () => {
+      const created = createPipeline(dbPath, {
+        name: "test-tick-context",
+        trigger_message: "test",
+        steps: [
+          { name: "first", prompt: "Do first" },
+          { name: "second", prompt: "Do second with {{prev_result}}", depends_on: ["first"] },
+        ],
+      });
+      startPipeline(dbPath, created.pipelineId);
+
+      // Complete first step
+      const graph = loadDAG(dbPath, created.pipelineId);
+      const firstId = graph.nameToId["first"];
+      sqliteExec(dbPath, `UPDATE pipeline_steps SET status = 'running' WHERE id = ?`, [firstId]);
+      advanceStep(dbPath, firstId, { output: "First step output data", success: true });
+
+      const tick = pipelineTick(dbPath);
+      const secondStep = tick.work.find(w => w.stepName === "second");
+      assert.ok(secondStep);
+      assert.ok(secondStep.parentContext.includes("First step output data"));
     });
   });
 
