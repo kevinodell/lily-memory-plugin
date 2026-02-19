@@ -1,6 +1,6 @@
 # lily-memory
 
-Persistent memory plugin for OpenClaw agents. Hybrid keyword + semantic search with auto-capture, stuck-detection, and zero npm dependencies.
+Persistent memory plugin for OpenClaw agents. Hybrid keyword + semantic search with auto-capture, stuck-detection, and minimal dependencies.
 
 ## Features
 
@@ -12,12 +12,12 @@ Persistent memory plugin for OpenClaw agents. Hybrid keyword + semantic search w
 - **Compaction-aware** — Resets topic state and touches permanent facts when context compresses
 - **Dynamic entity management** — Config-driven allowlist plus runtime tool to add entities
 - **Graceful degradation** — Works without Ollama (keyword-only mode)
-- **Zero npm dependencies** — sqlite3 CLI + native fetch
+- **Minimal dependencies** — better-sqlite3 for secure parameterized queries + native fetch
 
 ## Requirements
 
 - Node.js 18+ (for native `fetch`)
-- SQLite 3.33+ with FTS5 (ships with macOS; `apt install sqlite3` on Linux)
+- `better-sqlite3` npm package (installed via `npm install`)
 - Optional: Ollama with `nomic-embed-text` model for vector search
 
 ## Installation
@@ -216,7 +216,7 @@ Tests use:
 - Temporary SQLite databases (cleanup after each test)
 - Mocked Ollama responses
 - Comprehensive edge case coverage
-- Zero external dependencies
+- Minimal external dependencies
 
 ## License
 

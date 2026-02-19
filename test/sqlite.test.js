@@ -5,7 +5,7 @@ import { tmpdir, homedir } from "node:os";
 import path from "node:path";
 import {
   resolveDbPath,
-  escapeSqlValue,
+  sanitizeValue,
   sqliteQuery,
   sqliteExec,
   ensureTables,
@@ -54,37 +54,37 @@ describe("SQLite utilities", () => {
     });
   });
 
-  describe("escapeSqlValue", () => {
+  describe("sanitizeValue", () => {
     it("returns normal string unchanged when no special chars", () => {
-      const result = escapeSqlValue("hello world");
+      const result = sanitizeValue("hello world");
       assert.equal(result, "hello world");
     });
 
     it("passes through single quotes (parameterized queries handle safety)", () => {
-      const result = escapeSqlValue("it's a test");
+      const result = sanitizeValue("it's a test");
       assert.equal(result, "it's a test");
     });
 
     it("removes null bytes", () => {
-      const result = escapeSqlValue("hello\0world");
+      const result = sanitizeValue("hello\0world");
       assert.equal(result, "helloworld");
     });
 
     it("returns empty string for null", () => {
-      const resultNull = escapeSqlValue(null);
-      const resultUndef = escapeSqlValue(undefined);
+      const resultNull = sanitizeValue(null);
+      const resultUndef = sanitizeValue(undefined);
       assert.equal(resultNull, "");
       assert.equal(resultUndef, "");
     });
 
     it("truncates at 10000 chars", () => {
       const longString = "a".repeat(15000);
-      const result = escapeSqlValue(longString);
+      const result = sanitizeValue(longString);
       assert.equal(result.length, 10000);
     });
 
     it("returns empty string for empty input", () => {
-      const result = escapeSqlValue("");
+      const result = sanitizeValue("");
       assert.equal(result, "");
     });
   });

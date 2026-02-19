@@ -1,7 +1,7 @@
 {
     "id": "lily-memory",
     "name": "Lily Memory",
-    "version": "5.2.1",
+    "version": "5.2.2",
     "description": "Persistent memory plugin for OpenClaw agents. SQLite FTS5 keyword search + Ollama vector embeddings with auto-capture, auto-recall, stuck-detection, and memory consolidation.",
     "kind": "memory",
     "main": "index.js",

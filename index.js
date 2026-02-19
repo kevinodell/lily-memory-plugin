@@ -1,7 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, escapeSqlValue, closeAllConnections } from "./lib/sqlite.js";
+import { resolveDbPath, ensureTables, sqliteQuery, sqliteExec, sanitizeValue, closeAllConnections } from "./lib/sqlite.js";
 import { checkOllamaHealth, storeEmbedding, vectorSearch, backfillEmbeddings } from "./lib/embeddings.js";
 import { loadEntitiesFromDb, addEntityToDb, mergeConfigEntities } from "./lib/entities.js";
 import { consolidateMemories } from "./lib/consolidation.js";
@@ -176,7 +176,7 @@ export default function register(api) {
       }
 
       const now = Date.now();
-      const se = escapeSqlValue(entity), sk = escapeSqlValue(key), sv = escapeSqlValue(value);
+      const se = sanitizeValue(entity), sk = sanitizeValue(key), sv = sanitizeValue(value);
       const ttlMs = { permanent: null, stable: 90*86400000, active: 14*86400000, session: 86400000 };
       let tc = ttlMs[ttl] !== undefined ? ttl : "stable";
 
