@@ -10,6 +10,7 @@ import { captureFromMessages } from "./lib/capture.js";
 import { extractTopicSignature, saveTopicHistory, checkStuck } from "./lib/stuck-detection.js";
 import { checkSessionHealth, getContextPressure } from "./lib/session-guard.js";
 import { DEFAULT_BUDGET } from "./lib/budget.js";
+import { DEFAULT_PROTECTED_ENTITIES, getSecurityEvents } from "./lib/security.js";
 
 // ============================================================================
 // Lily-Memory v5 — budget-aware context injection
@@ -42,7 +43,18 @@ export default function register(api) {
   const histPath = cfg.topicHistoryPath || path.join(path.dirname(dbPath), "topic-history.json");
   const baseBudget = cfg.injectionBudget || DEFAULT_BUDGET;
   const contextCap = cfg.contextTokenCap || 120000;
+  const capturePolicy = cfg.capturePolicy || "all";
   const log = api.logger || { info: (m) => console.log("[lily-memory]", m), warn: (m) => console.warn("[lily-memory]", m) };
+
+  // Build protected entities set from config + defaults
+  const protectedEntities = new Set(DEFAULT_PROTECTED_ENTITIES);
+  if (Array.isArray(cfg.protectedEntities)) {
+    for (const e of cfg.protectedEntities) {
+      if (e && typeof e === "string") protectedEntities.add(e.toLowerCase());
+    }
+  }
+
+  const securityOpts = { protectedEntities, capturePolicy };
 
   let vectorsAvailable = false;
   let runtimeEntities = new Set();
@@ -250,6 +262,28 @@ export default function register(api) {
     },
   }, { name: "memory_add_entity" });
 
+  // --- Tool: memory_security_log ---
+  api.registerTool({ name: "memory_security_log", label: "Memory Security Log",
+    description: "View recent blocked injection attempts against persistent memory. Use to identify suspicious sources and potential prompt injection attacks.",
+    parameters: { type: "object", properties: {
+      limit: { type: "number", description: "Max events to return (default: 10)" },
+      since_hours: { type: "number", description: "Hours to look back (default: 24)" },
+    } },
+    async execute(_id, { limit = 10, since_hours = 24 } = {}) {
+      const safeLimit = Math.max(1, Math.min(50, parseInt(limit, 10) || 10));
+      const sinceMs = Date.now() - (Math.max(1, parseInt(since_hours, 10) || 24) * 3600000);
+      const rows = getSecurityEvents(dbPath, sinceMs, safeLimit);
+      if (!rows.length) return { content: [{ type: "text", text: "No security events in the specified time window." }], details: { count: 0 } };
+      const lines = rows.map((r, i) => {
+        const time = new Date(r.timestamp).toISOString();
+        return `${i+1}. **${r.event_type}** [${time}]\n   Source: ${r.source_role} | Entity: ${r.entity} | Key: ${r.fact_key}\n   Value: ${r.fact_value}\n   Pattern: ${r.matched_pattern}\n   Snippet: ${r.source_snippet ? r.source_snippet.substring(0, 100) + "..." : "n/a"}`;
+      });
+      let text = `Security events (${rows.length}):\n\n${lines.join("\n\n")}`;
+      if (text.length > TOOL_RESULT_MAX_CHARS) text = text.substring(0, TOOL_RESULT_MAX_CHARS - 20) + "\n\n...(truncated)";
+      return { content: [{ type: "text", text }], details: { count: rows.length, events: rows } };
+    },
+  }, { name: "memory_security_log" });
+
   // --- Hook: before_agent_start (budget-aware recall with injection cooldown) ---
   if (autoRecall) {
     api.on("before_agent_start", async (event) => {
@@ -320,8 +354,9 @@ export default function register(api) {
 
       if (!event.success || !event.messages?.length) return;
       try {
-        const { stored, newDecisionIds } = captureFromMessages(dbPath, event.messages, maxCapturePerTurn, runtimeEntities, (m) => log.info(m));
+        const { stored, newDecisionIds, blocked } = captureFromMessages(dbPath, event.messages, maxCapturePerTurn, runtimeEntities, (m) => log.info(m), securityOpts);
         if (stored > 0) log.info?.(`lily-memory: auto-captured ${stored} facts this turn`);
+        if (blocked > 0) log.warn?.(`lily-memory: SECURITY — blocked ${blocked} suspicious fact(s) this turn`);
         if (vectorsAvailable && newDecisionIds.length > 0) {
           (async () => { for (const { id, text } of newDecisionIds) await storeEmbedding(dbPath, ollamaUrl, embModel, id, text); })().catch((e) => log.warn?.(`lily-memory: batch embedding failed: ${e.message}`));
         }

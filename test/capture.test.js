@@ -36,7 +36,7 @@ describe('captureFromMessages', () => {
     }
   });
 
-  test('assigns ttl_class=stable and importance=0.75 for user messages', () => {
+  test('assigns ttl_class=active and importance=0.5 for user messages (security downgrade)', () => {
     const { dbPath, dir } = makeDb();
     try {
       const messages = [
@@ -45,8 +45,8 @@ describe('captureFromMessages', () => {
       captureFromMessages(dbPath, messages, 10, runtimeEntities, silentLogger());
       const rows = sqliteQuery(dbPath, "SELECT ttl_class, importance FROM decisions WHERE entity = 'Kevin'");
       assert.ok(rows.length >= 1, 'should have a row');
-      assert.equal(rows[0].ttl_class, 'stable');
-      assert.equal(Number(rows[0].importance), 0.75);
+      assert.equal(rows[0].ttl_class, 'active');
+      assert.equal(Number(rows[0].importance), 0.5);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

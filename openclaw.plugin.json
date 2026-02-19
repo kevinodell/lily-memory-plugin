@@ -1,7 +1,7 @@
 {
     "id": "lily-memory",
     "name": "Lily Memory",
-    "version": "5.1.1",
+    "version": "5.2.0",
     "description": "Persistent memory plugin for OpenClaw agents. SQLite FTS5 keyword search + Ollama vector embeddings with auto-capture, auto-recall, stuck-detection, and memory consolidation.",
     "kind": "memory",
     "main": "index.js",
@@ -89,6 +89,18 @@
                 "minimum": 0.5,
                 "maximum": 0.95,
                 "description": "Reset session when estimated tokens exceed this fraction of contextTokens. Set to 0.95 for more tolerance."
+            },
+            "capturePolicy": {
+                "type": "string",
+                "enum": ["all", "assistant-only", "tagged-only"],
+                "default": "all",
+                "description": "Which message roles are eligible for auto-capture. 'all' captures from all sources with injection detection. 'assistant-only' only captures from assistant responses (safest). 'tagged-only' requires explicit <trusted-capture> tags."
+            },
+            "protectedEntities": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "Additional entity names that can only be written from assistant messages or memory_store tool. Built-in protected: config, system, note."
             }
         }
     },
@@ -104,6 +116,8 @@
         "embeddingModel": { "label": "Embedding Model", "help": "Ollama model for embeddings", "advanced": true },
         "consolidation": { "label": "Memory Consolidation", "help": "Deduplicate redundant entries on startup" },
         "vectorSimilarityThreshold": { "label": "Similarity Threshold", "help": "Minimum cosine similarity for vector results", "advanced": true },
-        "entities": { "label": "Additional Entities", "help": "Extra entity names to recognize" }
+        "entities": { "label": "Additional Entities", "help": "Extra entity names to recognize" },
+        "capturePolicy": { "label": "Capture Policy", "help": "Controls which message sources are eligible for auto-capture" },
+        "protectedEntities": { "label": "Protected Entities", "help": "Entities only writable from assistant messages or memory_store tool", "advanced": true }
     }
 }
